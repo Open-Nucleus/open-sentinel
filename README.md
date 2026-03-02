@@ -80,7 +80,7 @@ import asyncio
 from open_sentinel.agent import SentinelAgent
 from open_sentinel.adapters import CsvAdapter
 from open_sentinel.llm import OllamaEngine, MockLLMEngine
-from open_sentinel.outputs import ConsoleOutput, FileOutput, WebhookOutput
+from open_sentinel.outputs import ConsoleOutput, FileOutput, WebhookOutput, SmsOutput
 from open_sentinel.types import AgentConfig
 
 async def main():
@@ -119,10 +119,15 @@ asyncio.run(main())
 | `ConsoleOutput` | stdout | Plain text or JSON format |
 | `FileOutput` | JSON Lines file | Append-only, severity filtering |
 | `WebhookOutput` | HTTP endpoint | HMAC-SHA256 signing, severity filtering, failure tolerance |
+| `SmsOutput` | SMS (Africa's Talking / Twilio) | 160-char body, severity filtering, dual provider support |
+| `EmailOutput` | SMTP email | Structured body with AI provenance, TLS support |
+| `FhirFlagOutput` | FHIR DetectedIssue R4 JSON files | AI provenance extensions, patient references |
 
-## Built-in IDSR Skills
+## Built-in Skills
 
-Five WHO IDSR epidemic surveillance skills, all built on `IdsrBaseSkill`:
+### IDSR Epidemic Surveillance
+
+Five WHO IDSR epidemic surveillance skills built on `IdsrBaseSkill`:
 
 | Skill | ICD-10 | Threshold | Confidence |
 |-------|--------|-----------|------------|
@@ -132,7 +137,22 @@ Five WHO IDSR epidemic surveillance skills, all built on `IdsrBaseSkill`:
 | `idsr-yellow-fever` | A95 | Zero tolerance — any case → critical | 0.8 |
 | `idsr-ebola` | A98.3, A98.4 | Zero tolerance + hemorrhagic sentinel | 0.85 |
 
-Each skill has dual-engine execution (LLM primary, rule-based fallback) and cross-references LLM findings against actual data via the reflection loop.
+### Clinical & Supply Chain Skills
+
+Eight heterogeneous skills implementing the `Skill` ABC directly, with shared utilities from `clinical_base.py`:
+
+| Skill | Category | Priority | Trigger | Key Thresholds |
+|-------|----------|----------|---------|----------------|
+| `medication-missed-dose` | Medication safety | HIGH | Event (MedicationAdministration) | ≥3 consecutive missed (high-stakes ART/TB/insulin), ≥5 any medication |
+| `medication-interaction-retro` | Medication safety | HIGH | Event (MedicationRequest) | Known DDI pairs (rifampicin+ART, warfarin+NSAID, etc.) |
+| `stockout-prediction` | Supply chain | MEDIUM | Schedule (weekly) | days_remaining < 30 based on consumption rate |
+| `stockout-critical` | Supply chain | HIGH | Event (SupplyDelivery) | Zero stock or < 7 days remaining |
+| `immunisation-gap` | Immunisation | MEDIUM | Schedule (weekly) | Overdue > 4 weeks per WHO EPI schedule |
+| `tb-treatment-completion` | TB | MEDIUM | Schedule (weekly) | Last dispensed > 14 days with active care plan |
+| `maternal-risk-scoring` | Maternal health | HIGH | Event (Observation) | Systolic >160, diastolic >110, platelets <100k; 2+ = CRITICAL |
+| `vital-sign-trend` | Clinical deterioration | HIGH | Event (Observation) | SpO2 <92%, HR >120/<40, RR >30, Temp >38.5/40; 2+ = CRITICAL |
+
+All 13 skills have dual-engine execution (LLM primary, rule-based fallback) and cross-reference LLM findings against actual data via the reflection loop.
 
 ## Writing a Skill
 
@@ -296,27 +316,53 @@ open_sentinel/
 ├── outputs/
 │   ├── console.py        # Console alert output
 │   ├── file_output.py    # JSON Lines file output
-│   └── webhook.py        # HTTP webhook output (HMAC-SHA256)
+│   ├── webhook.py        # HTTP webhook output (HMAC-SHA256)
+│   ├── sms.py            # SMS output (Africa's Talking / Twilio)
+│   ├── email_output.py   # Email output (aiosmtplib)
+│   └── fhir_flag.py      # FHIR DetectedIssue R4 JSON output
 ├── skills/
-│   └── idsr_base.py      # IdsrBaseSkill: shared base for IDSR skills
+│   ├── idsr_base.py      # IdsrBaseSkill: shared base for IDSR skills
+│   └── clinical_base.py  # Shared schemas/helpers for clinical/supply skills
 └── testing/
     ├── harness.py        # SkillTestHarness
     ├── fixtures.py       # make_data_event(), make_alert(), make_episode()
     └── mock_llm.py       # Re-exports MockLLMEngine
 
-skills/                   # Deployed skill folders (SKILL.md + skill.py each)
-├── idsr-cholera/         # Cholera outbreak detection (A00)
-├── idsr-measles/         # Measles outbreak detection (B05)
-├── idsr-meningitis/      # Meningitis detection with seasonal awareness (A39)
-├── idsr-yellow-fever/    # Yellow fever zero-tolerance detection (A95)
-└── idsr-ebola/           # Ebola + hemorrhagic fever sentinel (A98)
+skills/                           # Deployed skill folders (SKILL.md + skill.py each)
+├── idsr-cholera/                 # Cholera outbreak detection (A00)
+├── idsr-measles/                 # Measles outbreak detection (B05)
+├── idsr-meningitis/              # Meningitis detection with seasonal awareness (A39)
+├── idsr-yellow-fever/            # Yellow fever zero-tolerance detection (A95)
+├── idsr-ebola/                   # Ebola + hemorrhagic fever sentinel (A98)
+├── medication-missed-dose/       # Medication adherence gap detection
+├── medication-interaction-retro/ # Retrospective drug-drug interaction detection
+├── stockout-prediction/          # Weekly supply stockout forecasting
+├── stockout-critical/            # Emergency zero-stock detection
+├── immunisation-gap/             # EPI schedule compliance monitoring
+├── tb-treatment-completion/      # TB treatment abandonment risk
+├── maternal-risk-scoring/        # Pre-eclampsia / HELLP risk scoring
+└── vital-sign-trend/             # Acute vital sign deterioration detection
 ```
+
+## Resilience
+
+### LLM Timeout
+
+LLM calls (`reason()` and the reflection loop) are wrapped with `asyncio.wait_for()` using a configurable timeout (`AgentConfig.llm_timeout_seconds`, default 60s). On timeout, the agent falls back to the rule-based path automatically.
+
+### Adapter Retry
+
+Data fetches retry up to 3 times with exponential backoff (1s, 2s, 4s). Failed fetches emit lifecycle events (`data.fetch.retry`, `data.fetch.failed`) and degrade gracefully — the skill runs with whatever data was successfully fetched.
+
+### Skill Loader
+
+`load_skill_directory()` walks a directory of skill folders, imports each `skill.py` via `importlib.util`, discovers `Skill` subclasses, and attaches `SKILL.md` paths. Invalid skills are skipped with a warning.
 
 ## Roadmap
 
 - **Phase 1** ✅ — Core framework, agent loop, memory, reflection, guardrails, test harness
 - **Phase 2** ✅ — Data adapters (FHIR Git, SQLite, CSV), 5 IDSR skills, file/webhook outputs
-- **Phase 3** — Medication, stockout, immunisation, TB, maternal skills, SMS output, full feedback loop
+- **Phase 3** ✅ — 8 clinical/supply skills, SMS/email/FHIR outputs, skill loader, LLM timeout + adapter retry
 - **Phase 4** — Syndromic surveillance, SentinelHub skill registry, DHIS2/OpenMRS adapters
 - **Phase 5** — Documentation, evaluation framework, Pi 4 deployment guide
 

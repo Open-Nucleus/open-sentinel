@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import logging
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import frontmatter
@@ -121,6 +125,40 @@ class SkillRegistry:
 
 
 def load_skill_directory(path: str) -> List[Skill]:
-    """Stub for Phase 1. Full implementation in Phase 2."""
-    logger.info("load_skill_directory is a Phase 1 stub, returning empty list")
-    return []
+    """Walk a directory, import skill.py from each subdirectory, return Skill instances."""
+    root = Path(path)
+    if not root.is_dir():
+        logger.warning("Skill directory does not exist: %s", path)
+        return []
+
+    skills: List[Skill] = []
+    for subdir in sorted(root.iterdir()):
+        if not subdir.is_dir():
+            continue
+        skill_py = subdir / "skill.py"
+        if not skill_py.exists():
+            continue
+
+        module_name = f"_sentinel_skill_{subdir.name.replace('-', '_')}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, str(skill_py))
+            if spec is None or spec.loader is None:
+                logger.warning("Cannot create module spec for %s", skill_py)
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
+
+            # Find Skill subclasses in the module
+            skill_md_path = subdir / "SKILL.md"
+            for _, cls in inspect.getmembers(mod, inspect.isclass):
+                if issubclass(cls, Skill) and cls is not Skill and cls.__module__ == module_name:
+                    if skill_md_path.exists():
+                        cls.__skill_md_path__ = str(skill_md_path)
+                    instance = cls()
+                    skills.append(instance)
+                    logger.info("Loaded skill %s from %s", instance.name(), subdir.name)
+        except Exception:
+            logger.exception("Failed to load skill from %s", subdir.name)
+
+    return skills

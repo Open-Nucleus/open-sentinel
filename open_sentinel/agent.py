@@ -217,7 +217,17 @@ class SentinelAgent:
         await self.hooks.run("before_llm_prompt", skill, system_prompt, prompt)
         self.events.emit("llm.inference.started", run_id=run_id, model=self.llm.model())
 
-        response = await self.llm.reason(system_prompt, prompt, skill.goal() or "Analyze", schema)
+        try:
+            response = await asyncio.wait_for(
+                self.llm.reason(system_prompt, prompt, skill.goal() or "Analyze", schema),
+                timeout=self.config.llm_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("LLM reason timeout for skill %s after %ds", skill_name,
+                           self.config.llm_timeout_seconds)
+            self.events.emit("llm.timeout", run_id=run_id, skill=skill_name, phase="reason")
+            return await self._run_rule_path(skill, event)
+
         total_tokens += response.tokens_used
 
         self.events.emit(
@@ -231,9 +241,17 @@ class SentinelAgent:
         findings = _parse_structured(response.text)
 
         # 5. Reflection loop
-        findings, reflection_count = await self._reflection.run_reflection_loop(
-            findings, skill, ctx, self.llm, prompt, schema, run_id
-        )
+        try:
+            findings, reflection_count = await asyncio.wait_for(
+                self._reflection.run_reflection_loop(
+                    findings, skill, ctx, self.llm, prompt, schema, run_id
+                ),
+                timeout=self.config.llm_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Reflection timeout for skill %s", skill_name)
+            self.events.emit("llm.timeout", run_id=run_id, skill=skill_name, phase="reflection")
+            return await self._run_rule_path(skill, event)
 
         # 6. Tool use (additional data requests)
         if skill.can_request_additional_data():
@@ -481,11 +499,41 @@ class SentinelAgent:
     async def _fetch_data(
         self, req: DataRequirement, event: DataEvent
     ) -> Any:
-        if req.metric and req.group_by and self.data.supports("aggregate"):
-            return await self.data.aggregate(
-                req.resource_type, req.group_by, req.metric, req.filters
-            )
-        return await self.data.query(req.resource_type, req.filters, req.limit)
+        max_attempts = 3
+        backoff_seconds = [1, 2, 4]
+
+        for attempt in range(max_attempts):
+            try:
+                if req.metric and req.group_by and self.data.supports("aggregate"):
+                    return await self.data.aggregate(
+                        req.resource_type, req.group_by, req.metric, req.filters
+                    )
+                return await self.data.query(req.resource_type, req.filters, req.limit)
+            except Exception:
+                if attempt < max_attempts - 1:
+                    delay = backoff_seconds[attempt]
+                    logger.warning(
+                        "Data fetch attempt %d/%d failed for %s, retrying in %ds",
+                        attempt + 1, max_attempts, req.resource_type, delay,
+                    )
+                    self.events.emit(
+                        "data.fetch.retry",
+                        resource_type=req.resource_type,
+                        attempt=attempt + 1,
+                        delay=delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "Data fetch failed after %d attempts for %s",
+                        max_attempts, req.resource_type,
+                    )
+                    self.events.emit(
+                        "data.fetch.failed",
+                        resource_type=req.resource_type,
+                        attempts=max_attempts,
+                    )
+                    raise
 
     async def process_feedback(
         self, alert_id: str, outcome: str, feedback: Optional[str] = None
