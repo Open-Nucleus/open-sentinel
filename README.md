@@ -78,20 +78,24 @@ ruff check open_sentinel/ tests/
 ```python
 import asyncio
 from open_sentinel.agent import SentinelAgent
-from open_sentinel.llm import MockLLMEngine  # or OllamaEngine
-from open_sentinel.outputs.console import ConsoleOutput
+from open_sentinel.adapters import CsvAdapter
+from open_sentinel.llm import OllamaEngine, MockLLMEngine
+from open_sentinel.outputs import ConsoleOutput, FileOutput, WebhookOutput
 from open_sentinel.types import AgentConfig
-
-# Your skill + adapter implementations
-from my_skills import CholeraSkill
-from my_adapters import MyDataAdapter
 
 async def main():
     agent = SentinelAgent(
-        data_adapter=MyDataAdapter(),
-        llm=MockLLMEngine(),  # or OllamaEngine("http://localhost:11434")
-        skills=[CholeraSkill()],
-        outputs=[ConsoleOutput()],
+        data_adapter=CsvAdapter(
+            directory="./data",
+            resource_type_file_map={"Condition": "conditions.csv"},
+        ),
+        llm=OllamaEngine("http://localhost:11434"),  # or MockLLMEngine()
+        skills=[IdsrCholeraSkill()],
+        outputs=[
+            ConsoleOutput(),
+            FileOutput(path="alerts.jsonl"),
+            WebhookOutput(url="https://hooks.example.com/alerts"),
+        ],
         config=AgentConfig(hardware="pi4_8gb"),
     )
     await agent.start()
@@ -99,6 +103,36 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Data Adapters
+
+| Adapter | Source | Key Features |
+|---------|--------|--------------|
+| `CsvAdapter` | CSV/TSV files in a directory | Resource type → file mapping, in-memory filtering |
+| `SqliteAdapter` | User-managed SQLite DB | WAL mode, SQL-level filtering and aggregation |
+| `FhirGitAdapter` | FHIR JSON in a Git repo | SQLite index for fast queries, loads full JSON on demand |
+
+## Alert Outputs
+
+| Output | Target | Key Features |
+|--------|--------|--------------|
+| `ConsoleOutput` | stdout | Plain text or JSON format |
+| `FileOutput` | JSON Lines file | Append-only, severity filtering |
+| `WebhookOutput` | HTTP endpoint | HMAC-SHA256 signing, severity filtering, failure tolerance |
+
+## Built-in IDSR Skills
+
+Five WHO IDSR epidemic surveillance skills, all built on `IdsrBaseSkill`:
+
+| Skill | ICD-10 | Threshold | Confidence |
+|-------|--------|-----------|------------|
+| `idsr-cholera` | A00 | Zero-to-one → critical, 2× baseline → high | 0.7 |
+| `idsr-measles` | B05 | Zero-to-one → critical, ≥3 cluster → critical | 0.7 |
+| `idsr-meningitis` | A39, G00, G01 | Seasonal thresholds, off-season ≥2 → critical | 0.7 |
+| `idsr-yellow-fever` | A95 | Zero tolerance — any case → critical | 0.8 |
+| `idsr-ebola` | A98.3, A98.4 | Zero tolerance + hemorrhagic sentinel | 0.85 |
+
+Each skill has dual-engine execution (LLM primary, rule-based fallback) and cross-references LLM findings against actual data via the reflection loop.
 
 ## Writing a Skill
 
@@ -112,16 +146,19 @@ YAML frontmatter with clinical context:
 ---
 name: idsr-cholera
 priority: critical
-trigger: event
+trigger: both
+schedule: "0 6 * * 1"
 event_filter:
   resource_type: Condition
   code_prefix: "A00"
 requires:
   resources: [Condition]
   llm: true
+  adapter_features: [aggregate]
+  min_data_window: 12w
 goal: Detect cholera outbreaks within 24 hours
 max_reflections: 2
-confidence_threshold: 0.6
+confidence_threshold: 0.7
 ---
 
 ## Clinical Background
@@ -131,41 +168,47 @@ Cholera (ICD-10: A00) is an acute diarrheal disease...
 Compare current case counts against seasonal baselines...
 
 ## Rule-Based Fallback
-Alert if ≥3 confirmed cases within 4 weeks at a single site.
+baseline == 0 AND count >= 1 → CRITICAL; count > baseline * 2 → HIGH
 ```
 
 ### skill.py
 
 ```python
-from open_sentinel.interfaces import Skill
+from open_sentinel.skills.idsr_base import IdsrBaseSkill
 from open_sentinel.types import Alert, AnalysisContext, DataRequirement
 
-class CholeraSkill(Skill):
+class IdsrCholeraSkill(IdsrBaseSkill):
     def name(self) -> str:
         return "idsr-cholera"
 
     def required_data(self) -> dict[str, DataRequirement]:
         return {
-            "cases": DataRequirement(
+            "cholera_this_week": DataRequirement(
                 resource_type="Condition",
-                filters={"code": "A00"},
-                time_window="4w",
+                filters={"code_prefix": "A00"},
+                time_window="1w",
+                group_by=["site_id"],
+                metric="count",
             ),
         }
 
     def build_prompt(self, ctx: AnalysisContext) -> str:
-        cases = ctx.data.get("cases", [])
-        return f"Analyze {len(cases)} cholera cases for outbreak patterns."
+        counts = self._site_counts(ctx, "cholera_this_week")
+        return f"Analyze cholera data: {counts}"
 
     def rule_fallback(self, ctx: AnalysisContext) -> list[Alert]:
-        cases = ctx.data.get("cases", [])
-        if len(cases) >= 3:
-            return [Alert(
-                skill_name=self.name(),
-                severity="critical",
-                title="Cholera threshold exceeded",
-            )]
-        return []
+        counts = self._site_counts(ctx, "cholera_this_week")
+        alerts = []
+        for site_id, count in counts.items():
+            baseline = ctx.baselines.get(f"cholera-{site_id}", 0)
+            if baseline == 0 and count >= 1:
+                alerts.append(Alert(
+                    skill_name=self.name(),
+                    severity="critical",
+                    title=f"Cholera at {site_id} (zero baseline)",
+                    rule_validated=True,
+                ))
+        return alerts
 ```
 
 ## Testing Skills
@@ -228,36 +271,51 @@ The agent learns to be more cautious where it makes mistakes, but can never gate
 
 ```
 open_sentinel/
-├── agent.py          # SentinelAgent: core loop
-├── interfaces.py     # 5 ABCs (DataAdapter, LLMEngine, Skill, AlertOutput, MemoryStore)
-├── types.py          # Pydantic v2 models (Alert, DataEvent, Episode, etc.)
-├── memory.py         # SqliteMemoryStore
-├── registry.py       # SkillRegistry: SKILL.md parsing, event matching
-├── reflection.py     # Critique → reflect loop
-├── guardrails.py     # Confidence gate, hallucination detection, rate limiting
-├── feedback.py       # Human-in-the-loop calibration
-├── events.py         # EventBus: lifecycle events
-├── hooks.py          # HookRegistry: 11 extension points
-├── priority.py       # Skill + alert ranking
-├── resources.py      # Hardware profiles, LLM semaphore
-├── dedup.py          # Alert deduplication
-├── scheduler.py      # Cron-based scheduling
+├── agent.py              # SentinelAgent: core loop
+├── interfaces.py         # 5 ABCs (DataAdapter, LLMEngine, Skill, AlertOutput, MemoryStore)
+├── types.py              # Pydantic v2 models (Alert, DataEvent, Episode, etc.)
+├── time_utils.py         # Time window parser + epiweek calculator
+├── memory.py             # SqliteMemoryStore
+├── registry.py           # SkillRegistry: SKILL.md parsing, event matching
+├── reflection.py         # Critique → reflect loop
+├── guardrails.py         # Confidence gate, hallucination detection, rate limiting
+├── feedback.py           # Human-in-the-loop calibration
+├── events.py             # EventBus: lifecycle events
+├── hooks.py              # HookRegistry: 11 extension points
+├── priority.py           # Skill + alert ranking
+├── resources.py          # Hardware profiles, LLM semaphore
+├── dedup.py              # Alert deduplication
+├── scheduler.py          # Cron-based scheduling
+├── adapters/
+│   ├── csv_adapter.py    # CsvAdapter: CSV/TSV files
+│   ├── sqlite_adapter.py # SqliteAdapter: clinical SQLite DBs
+│   └── fhir_git.py       # FhirGitAdapter: FHIR JSON + SQLite index
 ├── llm/
-│   ├── mock.py       # MockLLMEngine for testing
-│   └── ollama.py     # OllamaEngine (OpenAI-compatible API)
+│   ├── mock.py           # MockLLMEngine for testing
+│   └── ollama.py         # OllamaEngine (OpenAI-compatible API)
 ├── outputs/
-│   └── console.py    # Console alert output
-├── adapters/         # Data adapters (Phase 2)
+│   ├── console.py        # Console alert output
+│   ├── file_output.py    # JSON Lines file output
+│   └── webhook.py        # HTTP webhook output (HMAC-SHA256)
+├── skills/
+│   └── idsr_base.py      # IdsrBaseSkill: shared base for IDSR skills
 └── testing/
-    ├── harness.py    # SkillTestHarness
-    ├── fixtures.py   # make_data_event(), make_alert(), make_episode()
-    └── mock_llm.py   # Re-exports MockLLMEngine
+    ├── harness.py        # SkillTestHarness
+    ├── fixtures.py       # make_data_event(), make_alert(), make_episode()
+    └── mock_llm.py       # Re-exports MockLLMEngine
+
+skills/                   # Deployed skill folders (SKILL.md + skill.py each)
+├── idsr-cholera/         # Cholera outbreak detection (A00)
+├── idsr-measles/         # Measles outbreak detection (B05)
+├── idsr-meningitis/      # Meningitis detection with seasonal awareness (A39)
+├── idsr-yellow-fever/    # Yellow fever zero-tolerance detection (A95)
+└── idsr-ebola/           # Ebola + hemorrhagic fever sentinel (A98)
 ```
 
 ## Roadmap
 
-- **Phase 1** (current) — Core framework, agent loop, memory, reflection, guardrails, test harness
-- **Phase 2** — Data adapters (FHIR Git, SQLite, CSV), IDSR skills, file/webhook outputs
+- **Phase 1** ✅ — Core framework, agent loop, memory, reflection, guardrails, test harness
+- **Phase 2** ✅ — Data adapters (FHIR Git, SQLite, CSV), 5 IDSR skills, file/webhook outputs
 - **Phase 3** — Medication, stockout, immunisation, TB, maternal skills, SMS output, full feedback loop
 - **Phase 4** — Syndromic surveillance, SentinelHub skill registry, DHIS2/OpenMRS adapters
 - **Phase 5** — Documentation, evaluation framework, Pi 4 deployment guide
