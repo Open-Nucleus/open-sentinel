@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "open-sentinel"
 version = "0.1.0"
 description = "LLM-powered sleeper agent for passive clinical surveillance"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.0",
