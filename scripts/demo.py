@@ -30,6 +30,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Load .env file from project root
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")
+except ImportError:
+    pass
+
 from open_sentinel.adapters.fhir_git import FhirGitAdapter
 from open_sentinel.memory import SqliteMemoryStore
 from open_sentinel.types import (

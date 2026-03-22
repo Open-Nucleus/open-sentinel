@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from open_sentinel.events import EventBus
 from open_sentinel.guardrails import GuardrailPipeline
 from open_sentinel.hooks import HookRegistry
-from open_sentinel.interfaces import Skill
+from open_sentinel.interfaces import LLMEngine, Skill
 from open_sentinel.llm.mock import MockLLMEngine
 from open_sentinel.memory import SqliteMemoryStore
 from open_sentinel.reflection import ReflectionEngine, _parse_structured
@@ -35,7 +35,7 @@ class SkillTestHarness:
     def __init__(
         self,
         skill: Skill,
-        llm: Optional[MockLLMEngine] = None,
+        llm: Optional[LLMEngine] = None,
         config: Optional[AgentConfig] = None,
     ):
         self.skill = skill

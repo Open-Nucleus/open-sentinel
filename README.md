@@ -11,6 +11,7 @@ Every alert requires human review. No automated clinical action, ever.
 ## Key Features
 
 - **Offline-first** — runs on Raspberry Pi 4 (8GB) with Ollama, no internet required
+- **Cloud-ready** — connect to OpenAI (GPT-4o) or any compatible API for maximum reasoning quality
 - **Dual-engine execution** — LLM reasoning as primary path, deterministic rules as fallback when LLM is unavailable
 - **Reflection loop** — LLM findings are critiqued against actual data and refined (up to 3 iterations)
 - **Hallucination detection** — evidence in alerts is cross-referenced against fetched data
@@ -38,7 +39,7 @@ Sleep → Wake → Route → Analyze → Alert → Sleep
 | Interface | Role |
 |-----------|------|
 | `DataAdapter` | Read clinical data from any source (FHIR, DHIS2, OpenMRS, SQLite, CSV) |
-| `LLMEngine` | Core reasoning — reason, reflect, explain, plan |
+| `LLMEngine` | Core reasoning — reason, reflect, explain, plan (OpenAI, Ollama, Mock) |
 | `Skill` | Pluggable analysis unit with LLM + rule-based paths |
 | `AlertOutput` | Emit alerts to targets (FHIR Flag, webhook, SMS, email, console) |
 | `MemoryStore` | Four-tier memory — working, episodic, semantic, procedural (SQLite) |
@@ -58,6 +59,9 @@ Sleep → Wake → Route → Analyze → Alert → Sleep
 # From source (editable mode)
 pip install -e ".[dev]"
 
+# With OpenAI support
+pip install -e ".[dev,openai]"
+
 # Run tests
 pytest tests/ -v
 
@@ -72,15 +76,71 @@ ruff check open_sentinel/ tests/
 
 - Python 3.11+
 - For local LLM: [Ollama](https://ollama.com) with `phi3:mini` or `llama3.2`
+- For cloud LLM: an OpenAI API key
 
 ## Quick Start
+
+### Option 1: Cloud (OpenAI)
+
+The fastest way to see open-sentinel in action. Create a `.env` file in the project root:
+
+```bash
+# .env
+OPENAI_API_KEY=sk-your-key-here
+OPENAI_MODEL=gpt-4o          # optional, defaults to gpt-4o
+```
+
+Then run the demo:
+
+```bash
+python demo.py
+```
+
+This runs the cholera outbreak detection skill against sample surveillance data from three health facilities — full LLM reasoning, reflection loop, hallucination detection, and alert generation.
+
+You can also pass the key inline:
+
+```bash
+OPENAI_API_KEY=sk-... python demo.py
+```
+
+### Option 2: Local (Ollama)
+
+For offline/air-gapped deployments on Raspberry Pi or similar:
+
+```bash
+ollama pull phi3:mini
+python -c "
+import asyncio
+from open_sentinel.agent import SentinelAgent
+from open_sentinel.adapters import CsvAdapter
+from open_sentinel.llm import OllamaEngine
+from open_sentinel.outputs import ConsoleOutput
+from open_sentinel.types import AgentConfig
+
+async def main():
+    agent = SentinelAgent(
+        data_adapter=CsvAdapter('./data', {'Condition': 'conditions.csv'}),
+        llm=OllamaEngine('http://localhost:11434'),
+        skills=[],  # load via load_skill_directory('./skills/')
+        outputs=[ConsoleOutput()],
+        config=AgentConfig(hardware='pi4_8gb'),
+    )
+    await agent.start()
+    await agent.run()
+
+asyncio.run(main())
+"
+```
+
+### Programmatic Usage
 
 ```python
 import asyncio
 from open_sentinel.agent import SentinelAgent
 from open_sentinel.adapters import CsvAdapter
-from open_sentinel.llm import OllamaEngine, MockLLMEngine
-from open_sentinel.outputs import ConsoleOutput, FileOutput, WebhookOutput, SmsOutput
+from open_sentinel.llm import OpenAIEngine  # or OllamaEngine, MockLLMEngine
+from open_sentinel.outputs import ConsoleOutput, FileOutput, WebhookOutput
 from open_sentinel.types import AgentConfig
 
 async def main():
@@ -89,14 +149,14 @@ async def main():
             directory="./data",
             resource_type_file_map={"Condition": "conditions.csv"},
         ),
-        llm=OllamaEngine("http://localhost:11434"),  # or MockLLMEngine()
+        llm=OpenAIEngine(model_name="gpt-4o"),  # reads OPENAI_API_KEY from .env
         skills=[IdsrCholeraSkill()],
         outputs=[
             ConsoleOutput(),
             FileOutput(path="alerts.jsonl"),
             WebhookOutput(url="https://hooks.example.com/alerts"),
         ],
-        config=AgentConfig(hardware="pi4_8gb"),
+        config=AgentConfig(hardware="cloud"),
     )
     await agent.start()
     await agent.run()
@@ -260,10 +320,26 @@ async def test_degraded():
     assert result.alerts[0].rule_validated is True
 ```
 
+## LLM Engines
+
+| Engine | Use Case | Model | Auth |
+|--------|----------|-------|------|
+| `OpenAIEngine` | Cloud demo / production | gpt-4o, gpt-4o-mini | `OPENAI_API_KEY` via `.env` or env var |
+| `OllamaEngine` | Offline / Raspberry Pi | phi3:mini, llama3.2 | Local endpoint (no auth) |
+| `MockLLMEngine` | Testing | mock-model | None |
+
+The `OpenAIEngine` loads credentials from a `.env` file automatically (via `python-dotenv`). Create a `.env` file in the project root:
+
+```bash
+OPENAI_API_KEY=sk-your-key-here
+OPENAI_MODEL=gpt-4o
+```
+
 ## Hardware Profiles
 
 | Profile | LLM | Concurrent Skills | Max Reflections | Model |
 |---------|-----|-------------------|-----------------|-------|
+| `cloud` | Yes | 8 | 3 | gpt-4o |
 | `pi4_4gb` | No | 4 | 0 | None (rules only) |
 | `pi4_8gb` | Yes | 2 | 2 | phi3:mini |
 | `hub_16gb` | Yes | 4 | 3 | llama3.2:3b |
@@ -312,7 +388,8 @@ open_sentinel/
 │   └── fhir_git.py       # FhirGitAdapter: FHIR JSON + SQLite index
 ├── llm/
 │   ├── mock.py           # MockLLMEngine for testing
-│   └── ollama.py         # OllamaEngine (OpenAI-compatible API)
+│   ├── ollama.py         # OllamaEngine (OpenAI-compatible API)
+│   └── openai_engine.py  # OpenAIEngine (cloud, .env support)
 ├── outputs/
 │   ├── console.py        # Console alert output
 │   ├── file_output.py    # JSON Lines file output
@@ -363,6 +440,7 @@ Data fetches retry up to 3 times with exponential backoff (1s, 2s, 4s). Failed f
 - **Phase 1** ✅ — Core framework, agent loop, memory, reflection, guardrails, test harness
 - **Phase 2** ✅ — Data adapters (FHIR Git, SQLite, CSV), 5 IDSR skills, file/webhook outputs
 - **Phase 3** ✅ — 8 clinical/supply skills, SMS/email/FHIR outputs, skill loader, LLM timeout + adapter retry
+- **Phase 3.5** ✅ — OpenAI cloud engine, `.env` config, `cloud` hardware profile, end-to-end demo
 - **Phase 4** — Syndromic surveillance, SentinelHub skill registry, DHIS2/OpenMRS adapters
 - **Phase 5** — Documentation, evaluation framework, Pi 4 deployment guide
 

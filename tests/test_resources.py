@@ -25,7 +25,7 @@ class TestResourceManager:
         assert rm.profile.model == "llama3.2:8b"
 
     def test_all_profiles_exist(self):
-        expected = {"pi4_4gb", "pi4_8gb", "uconsole_8gb", "hub_16gb", "hub_32gb"}
+        expected = {"pi4_4gb", "pi4_8gb", "uconsole_8gb", "hub_16gb", "hub_32gb", "cloud"}
         assert set(PROFILES.keys()) == expected
 
     async def test_llm_semaphore(self):

@@ -25,6 +25,7 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.5",
 ]
+openai = ["openai>=1.0", "python-dotenv>=1.0"]
 
 [project.scripts]
 sentinel = "open_sentinel.cli:main"

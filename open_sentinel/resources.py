@@ -37,6 +37,10 @@ PROFILES: Dict[str, HardwareProfile] = {
         "hub_32gb", llm_enabled=True,
         concurrent_skills=8, max_reflections=3, model="llama3.2:8b",
     ),
+    "cloud": HardwareProfile(
+        "cloud", llm_enabled=True,
+        concurrent_skills=8, max_reflections=3, model="gpt-4o",
+    ),
 }
 
 
